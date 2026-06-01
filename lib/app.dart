@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:google_fonts/google_fonts.dart';
 import 'core/preferences/app_preferences.dart';
 import 'pages/login/login_page.dart';
 import 'pages/dashboard/dashboard_page.dart';
@@ -15,6 +16,8 @@ import 'pages/tickets/ticket_list_page.dart';
 import 'pages/tickets/ticket_add_page.dart';
 import 'pages/tickets/ticket_detail_page.dart';
 import 'pages/settings/settings_page.dart';
+import 'pages/hosting/hosting_crud_page.dart';
+import 'pages/hosting/hosting_feature_spec.dart';
 
 class App extends StatelessWidget {
   // Static notifier to allow runtime theme changes from settings page
@@ -22,7 +25,7 @@ class App extends StatelessWidget {
     ThemeMode.light,
   );
 
-  const App({Key? key}) : super(key: key);
+  const App({super.key});
 
   @override
   Widget build(BuildContext context) {
@@ -47,29 +50,33 @@ class App extends StatelessWidget {
             useMaterial3: true,
             brightness: Brightness.light,
             colorScheme: ColorScheme.fromSeed(
-              seedColor: Colors.teal,
+              seedColor: const Color(0xFF0F766E),
               brightness: Brightness.light,
-              primary: Colors.teal,
-              secondary: Colors.tealAccent.shade700,
+              primary: const Color(0xFF0F766E),
+              secondary: const Color(0xFFF59E0B),
             ),
-            scaffoldBackgroundColor: Colors.grey.shade50,
+            scaffoldBackgroundColor: const Color(0xFFF7FAFC),
             cardColor: Colors.white,
+            textTheme: GoogleFonts.plusJakartaSansTextTheme(
+              ThemeData.light().textTheme,
+            ),
             appBarTheme: AppBarTheme(
               backgroundColor: Colors.transparent,
               elevation: 0,
-              centerTitle: true,
+              centerTitle: false,
               iconTheme: IconThemeData(color: Colors.black.withOpacity(0.8)),
               titleTextStyle: TextStyle(
                 color: Colors.black.withOpacity(0.85),
                 fontSize: 20,
-                fontWeight: FontWeight.bold,
+                fontWeight: FontWeight.w800,
               ),
             ),
             inputDecorationTheme: InputDecorationTheme(
               filled: true,
               fillColor: Colors.white,
               border: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(12),
+                borderRadius: BorderRadius.circular(18),
+                borderSide: BorderSide.none,
               ),
               contentPadding: const EdgeInsets.symmetric(
                 horizontal: 16,
@@ -79,8 +86,15 @@ class App extends StatelessWidget {
             elevatedButtonTheme: ElevatedButtonThemeData(
               style: ElevatedButton.styleFrom(
                 shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(12),
+                  borderRadius: BorderRadius.circular(16),
                 ),
+              ),
+            ),
+            cardTheme: CardThemeData(
+              color: Colors.white,
+              elevation: 0,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(24),
               ),
             ),
           ),
@@ -89,29 +103,33 @@ class App extends StatelessWidget {
             useMaterial3: true,
             brightness: Brightness.dark,
             colorScheme: ColorScheme.fromSeed(
-              seedColor: Colors.teal,
+              seedColor: const Color(0xFF0F766E),
               brightness: Brightness.dark,
-              primary: Colors.teal.shade400,
-              secondary: Colors.tealAccent,
+              primary: const Color(0xFF14B8A6),
+              secondary: const Color(0xFFFBBF24),
             ),
-            scaffoldBackgroundColor: Colors.grey.shade900,
-            cardColor: Colors.grey.shade900,
+            scaffoldBackgroundColor: const Color(0xFF08111F),
+            cardColor: const Color(0xFF0F172A),
+            textTheme: GoogleFonts.plusJakartaSansTextTheme(
+              ThemeData.dark().textTheme,
+            ),
             appBarTheme: const AppBarTheme(
               backgroundColor: Colors.transparent,
               elevation: 0,
-              centerTitle: true,
+              centerTitle: false,
               iconTheme: IconThemeData(color: Colors.white),
               titleTextStyle: TextStyle(
                 color: Colors.white,
                 fontSize: 20,
-                fontWeight: FontWeight.bold,
+                fontWeight: FontWeight.w800,
               ),
             ),
             inputDecorationTheme: InputDecorationTheme(
               filled: true,
-              fillColor: Colors.grey.shade900,
+              fillColor: const Color(0xFF111827),
               border: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(12),
+                borderRadius: BorderRadius.circular(18),
+                borderSide: BorderSide.none,
               ),
               contentPadding: const EdgeInsets.symmetric(
                 horizontal: 16,
@@ -121,8 +139,15 @@ class App extends StatelessWidget {
             elevatedButtonTheme: ElevatedButtonThemeData(
               style: ElevatedButton.styleFrom(
                 shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(12),
+                  borderRadius: BorderRadius.circular(16),
                 ),
+              ),
+            ),
+            cardTheme: CardThemeData(
+              color: const Color(0xFF0F172A),
+              elevation: 0,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(24),
               ),
             ),
           ),
@@ -130,6 +155,22 @@ class App extends StatelessWidget {
           routes: {
             '/login': (context) => const LoginPage(),
             '/dashboard': (context) => const DashboardPage(),
+            '/hosting/nginx-config': (context) =>
+                const HostingCrudPage(feature: HostingFeatures.nginxConfig),
+            '/hosting/subdomain': (context) =>
+                const HostingCrudPage(feature: HostingFeatures.subdomain),
+            '/hosting/domain': (context) =>
+                const HostingCrudPage(feature: HostingFeatures.domain),
+            '/hosting/project': (context) =>
+                const HostingCrudPage(feature: HostingFeatures.project),
+            '/hosting/file-manager': (context) =>
+                const HostingCrudPage(feature: HostingFeatures.fileManager),
+            '/hosting/api-monitoring': (context) =>
+                const HostingCrudPage(feature: HostingFeatures.apiMonitoring),
+            '/hosting/other-services': (context) =>
+                const HostingCrudPage(feature: HostingFeatures.otherServices),
+            '/hosting/server': (context) =>
+                const HostingCrudPage(feature: HostingFeatures.server),
             // Domain routes
             '/domains': (context) => const DomainListPage(),
             '/domains/add': (context) => const DomainAddPage(),

@@ -3,6 +3,7 @@ import 'package:flutter/foundation.dart';
 import 'package:path/path.dart';
 import 'package:sqflite/sqflite.dart';
 import 'package:sqflite_common_ffi_web/sqflite_ffi_web.dart';
+import '../../models/hosting_record_model.dart';
 import '../../models/domain_model.dart';
 import '../../models/user_model.dart';
 import '../../models/package_model.dart';
@@ -21,7 +22,11 @@ class DatabaseHelper {
 
   Future<Database> _initDb() async {
     const dbName = 'kolabpanel.db';
-    final options = OpenDatabaseOptions(version: 1, onCreate: _onCreate);
+    final options = OpenDatabaseOptions(
+      version: 2,
+      onCreate: _onCreate,
+      onUpgrade: _onUpgrade,
+    );
 
     if (kIsWeb) {
       return databaseFactoryFfiWeb.openDatabase(dbName, options: options);
@@ -94,8 +99,36 @@ class DatabaseHelper {
       )
     ''');
 
+    await _createHostingRecordsTable(db);
+
     // Seed mock data
     await _seedData(db);
+    await _seedHostingRecords(db);
+  }
+
+  Future<void> _onUpgrade(Database db, int oldVersion, int newVersion) async {
+    if (oldVersion < 2) {
+      await _createHostingRecordsTable(db);
+      await _seedHostingRecords(db);
+    }
+  }
+
+  Future<void> _createHostingRecordsTable(Database db) async {
+    await db.execute('''
+      CREATE TABLE hosting_records (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        feature_key TEXT NOT NULL,
+        title TEXT NOT NULL,
+        primary_value TEXT NOT NULL,
+        secondary_value TEXT NOT NULL,
+        tertiary_value TEXT NOT NULL,
+        description TEXT NOT NULL,
+        status TEXT NOT NULL,
+        is_enabled INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )
+    ''');
   }
 
   Future<void> _seedData(Database db) async {
@@ -165,6 +198,123 @@ class DatabaseHelper {
     await db.rawInsert(
       "INSERT INTO tickets (user_id, subjek, pesan, status, prioritas, tanggal_buat, tanggal_update) VALUES (4, 'Ganti Email Kontak', 'Saya ingin mengubah email kontak utama akun saya.', 'closed', 'low', '2026-05-15 08:00:00', '2026-05-15 11:00:00')",
     );
+  }
+
+  Future<void> _seedHostingRecords(Database db) async {
+    final count = Sqflite.firstIntValue(
+      await db.rawQuery('SELECT COUNT(*) AS count FROM hosting_records'),
+    );
+
+    if ((count ?? 0) > 0) {
+      return;
+    }
+
+    final now = DateTime.now().toIso8601String();
+    final seedItems = <HostingRecord>[
+      HostingRecord(
+        featureKey: 'nginx_config',
+        title: 'app.example.com',
+        primaryValue: '/etc/nginx/sites-available/app.conf',
+        secondaryValue: 'app.example.com:80',
+        tertiaryValue: 'sites-enabled/app.conf',
+        description:
+            'server { listen 80; server_name app.example.com; root /var/www/app/public; }',
+        status: 'available',
+        isEnabled: false,
+        createdAt: now,
+        updatedAt: now,
+      ),
+      HostingRecord(
+        featureKey: 'subdomain',
+        title: 'dashboard.example.com',
+        primaryValue: 'localhost:80',
+        secondaryValue: 'cloudflared-tunnel',
+        tertiaryValue: 'proxy://127.0.0.1:80',
+        description: 'Subdomain tunnel untuk dashboard internal.',
+        status: 'active',
+        isEnabled: true,
+        createdAt: now,
+        updatedAt: now,
+      ),
+      HostingRecord(
+        featureKey: 'domain',
+        title: 'example.com',
+        primaryValue: 'ada.ns.cloudflare.com',
+        secondaryValue: 'nina.ns.cloudflare.com',
+        tertiaryValue: 'Cloudflare',
+        description: 'Nameserver dummy untuk pendaftaran domain.',
+        status: 'verified',
+        isEnabled: false,
+        createdAt: now,
+        updatedAt: now,
+      ),
+      HostingRecord(
+        featureKey: 'project',
+        title: 'Landing Page',
+        primaryValue: 'landing.example.com',
+        secondaryValue: 'https://github.com/demo/landing',
+        tertiaryValue: 'Flutter',
+        description: 'Project demo landing page untuk panel hosting.',
+        status: 'planning',
+        isEnabled: false,
+        createdAt: now,
+        updatedAt: now,
+      ),
+      HostingRecord(
+        featureKey: 'file_manager',
+        title: 'public_html',
+        primaryValue: '/var/www/app/public_html',
+        secondaryValue: 'folder',
+        tertiaryValue: '755',
+        description: 'Folder publik untuk deploy file static.',
+        status: 'ready',
+        isEnabled: false,
+        createdAt: now,
+        updatedAt: now,
+      ),
+      HostingRecord(
+        featureKey: 'api_monitoring',
+        title: 'Health Check API',
+        primaryValue: 'https://api.example.com/health',
+        secondaryValue: '5',
+        tertiaryValue: '200',
+        description: 'Monitor API setiap 5 detik dan simpan status terakhir.',
+        status: 'healthy',
+        isEnabled: true,
+        createdAt: now,
+        updatedAt: now,
+      ),
+      HostingRecord(
+        featureKey: 'other_services',
+        title: 'Backup Storage',
+        primaryValue: 'https://backup.example.com',
+        secondaryValue: 'backup',
+        tertiaryValue: 'Ops Team',
+        description: 'Tautan layanan backup dan dokumentasi cepat.',
+        status: 'active',
+        isEnabled: false,
+        createdAt: now,
+        updatedAt: now,
+      ),
+      HostingRecord(
+        featureKey: 'server',
+        title: 'Node-01',
+        primaryValue: '192.168.1.10',
+        secondaryValue: 'primary',
+        tertiaryValue: '22',
+        description: 'Node utama aplikasi dan web server.',
+        status: 'online',
+        isEnabled: false,
+        createdAt: now,
+        updatedAt: now,
+      ),
+    ];
+
+    final batch = db.batch();
+    for (final item in seedItems) {
+      batch.insert('hosting_records', item.toMap());
+    }
+    await batch.commit(noResult: true);
   }
 
   // --- CRUD ADMIN ---
@@ -339,6 +489,73 @@ class DatabaseHelper {
       where: 'id = ? AND status = ?',
       whereArgs: [id, 'closed'],
     );
+  }
+
+  // --- CRUD HOSTING RECORDS ---
+  Future<int> insertHostingRecord(HostingRecord record) async {
+    final db = await database;
+    return await db.insert('hosting_records', record.toMap());
+  }
+
+  Future<List<HostingRecord>> getHostingRecords(
+    String featureKey, {
+    String query = '',
+  }) async {
+    final db = await database;
+    final whereArgs = <dynamic>[featureKey];
+    var whereClause = 'feature_key = ?';
+
+    if (query.isNotEmpty) {
+      whereClause +=
+          ' AND (title LIKE ? OR primary_value LIKE ? OR secondary_value LIKE ? OR tertiary_value LIKE ? OR description LIKE ?)';
+      final likeQuery = '%$query%';
+      whereArgs.addAll([likeQuery, likeQuery, likeQuery, likeQuery, likeQuery]);
+    }
+
+    final rows = await db.query(
+      'hosting_records',
+      where: whereClause,
+      whereArgs: whereArgs,
+      orderBy: 'updated_at DESC, created_at DESC',
+    );
+
+    return List.generate(
+      rows.length,
+      (index) => HostingRecord.fromMap(rows[index]),
+    );
+  }
+
+  Future<int> updateHostingRecord(HostingRecord record) async {
+    final db = await database;
+    return await db.update(
+      'hosting_records',
+      record.toMap(),
+      where: 'id = ?',
+      whereArgs: [record.id],
+    );
+  }
+
+  Future<int> deleteHostingRecord(int id) async {
+    final db = await database;
+    return await db.delete('hosting_records', where: 'id = ?', whereArgs: [id]);
+  }
+
+  Future<int> countHostingRecords(String featureKey) async {
+    final db = await database;
+    final res = await db.rawQuery(
+      'SELECT COUNT(*) AS count FROM hosting_records WHERE feature_key = ?',
+      [featureKey],
+    );
+    return Sqflite.firstIntValue(res) ?? 0;
+  }
+
+  Future<List<Map<String, dynamic>>> getHostingCountsByFeature() async {
+    final db = await database;
+    return await db.rawQuery('''
+      SELECT feature_key, COUNT(*) AS count
+      FROM hosting_records
+      GROUP BY feature_key
+    ''');
   }
 
   // --- DASHBOARD AGGREGATIONS ---
