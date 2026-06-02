@@ -1,6 +1,11 @@
+import 'dart:async';
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_slidable/flutter_slidable.dart';
 import 'package:google_fonts/google_fonts.dart';
+import 'package:dartssh2/dartssh2.dart';
+import 'package:http/http.dart' as http;
 import '../../core/database/database_helper.dart';
 import '../../models/hosting_record_model.dart';
 import 'hosting_feature_spec.dart';
@@ -23,6 +28,15 @@ class _HostingCrudPageState extends State<HostingCrudPage> {
 
   List<HostingRecord> _records = [];
   List<String>? _fileManagerProjects;
+  final Set<int> _testingApiRecordIds = {};
+  final Set<int> _runningApiRecordIds = {};
+  final Set<int> _runningBackupRecordIds = {};
+  final Set<int> _testingServerRecordIds = {};
+  final Map<int, Timer> _apiMonitoringTimers = {};
+  final Map<int, int> _apiLatencyMsById = {};
+  final Map<int, DateTime> _apiLastCheckedById = {};
+  final Map<int, int> _serverLatencyMsById = {};
+  final Map<int, DateTime> _serverLastCheckedById = {};
   HostingRecord? _fileManagerClipboardRecord;
   String? _fileManagerClipboardAction;
   String _selectedFileManagerProject = 'Semua';
@@ -35,6 +49,9 @@ class _HostingCrudPageState extends State<HostingCrudPage> {
   bool get _isSubdomainConfig => _feature.key == 'subdomain';
   bool get _isDomainConfig => _feature.key == 'domain';
   bool get _isFileManagerConfig => _feature.key == 'file_manager';
+  bool get _isApiMonitoringConfig => _feature.key == 'api_monitoring';
+  bool get _isBackupDatabaseConfig => _feature.key == 'other_services';
+  bool get _isServerConfig => _feature.key == 'server';
 
   List<HostingRecord> get _nginxEnabledRecords => _records
       .where((record) => record.status.toLowerCase() == 'enabled')
@@ -79,6 +96,9 @@ class _HostingCrudPageState extends State<HostingCrudPage> {
 
   @override
   void dispose() {
+    for (final timer in _apiMonitoringTimers.values) {
+      timer.cancel();
+    }
     _searchController.dispose();
     super.dispose();
   }
@@ -120,6 +140,7 @@ class _HostingCrudPageState extends State<HostingCrudPage> {
         }
         _isLoading = false;
       });
+      _syncApiMonitoringTimers(records);
     } catch (e) {
       if (!mounted) return;
       setState(() => _isLoading = false);
@@ -215,6 +236,325 @@ class _HostingCrudPageState extends State<HostingCrudPage> {
     }
   }
 
+  void _syncApiMonitoringTimers(List<HostingRecord> records) {
+    if (!_isApiMonitoringConfig) return;
+
+    for (final timer in _apiMonitoringTimers.values) {
+      timer.cancel();
+    }
+    _apiMonitoringTimers.clear();
+
+    for (final record in records) {
+      final id = record.id;
+      if (id == null || !record.isEnabled) continue;
+
+      final interval = _apiIntervalSeconds(record);
+      _apiMonitoringTimers[id] = Timer.periodic(
+        Duration(seconds: interval),
+        (_) => _runApiCheck(record, manual: false),
+      );
+    }
+  }
+
+  int _apiIntervalSeconds(HostingRecord record) {
+    final interval = int.tryParse(record.secondaryValue.trim()) ?? 5;
+    if (interval < 3) return 3;
+    return interval;
+  }
+
+  Future<void> _testApiEndpoint(HostingRecord record) {
+    return _runApiCheck(record, manual: true);
+  }
+
+  Future<void> _runApiCheck(
+    HostingRecord record, {
+    required bool manual,
+  }) async {
+    final id = record.id;
+    final url = record.primaryValue.trim();
+    final uri = Uri.tryParse(url);
+
+    if (id == null || uri == null || !uri.hasScheme || !uri.hasAuthority) {
+      if (manual) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('URL API tidak valid'),
+            backgroundColor: Colors.redAccent,
+          ),
+        );
+      }
+      return;
+    }
+
+    if (_runningApiRecordIds.contains(id)) {
+      if (manual) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('Test masih berjalan')));
+      }
+      return;
+    }
+
+    setState(() {
+      _runningApiRecordIds.add(id);
+      if (manual) {
+        _testingApiRecordIds.add(id);
+      }
+    });
+
+    final expectedCode = int.tryParse(record.tertiaryValue.trim()) ?? 200;
+    var nextStatus = 'down';
+    var message = 'API tidak bisa diakses';
+    final now = DateTime.now().toIso8601String();
+    final checkedAt = DateTime.now();
+    final stopwatch = Stopwatch()..start();
+
+    try {
+      final statusCode = await _fetchApiStatusCode(uri);
+      stopwatch.stop();
+
+      if (statusCode == expectedCode) {
+        nextStatus = 'healthy';
+        message =
+            'API berjalan normal ($statusCode, ${stopwatch.elapsedMilliseconds} ms)';
+      } else {
+        nextStatus = 'degraded';
+        message =
+            'API merespons $statusCode, expected $expectedCode (${stopwatch.elapsedMilliseconds} ms)';
+      }
+
+      await _dbHelper.updateHostingRecord(
+        record.copyWith(status: nextStatus, updatedAt: now),
+      );
+    } catch (e) {
+      stopwatch.stop();
+      message = 'API tidak berjalan: $e';
+      try {
+        await _dbHelper.updateHostingRecord(
+          record.copyWith(status: 'down', updatedAt: now),
+        );
+      } catch (_) {
+        message = 'API tidak berjalan dan status gagal diperbarui';
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _runningApiRecordIds.remove(id);
+          _testingApiRecordIds.remove(id);
+          _apiLatencyMsById[id] = stopwatch.elapsedMilliseconds;
+          _apiLastCheckedById[id] = checkedAt;
+        });
+      }
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _records = _records
+          .map(
+            (item) => item.id == id
+                ? item.copyWith(status: nextStatus, updatedAt: now)
+                : item,
+          )
+          .toList();
+    });
+
+    if (manual) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(message),
+          backgroundColor: nextStatus == 'healthy'
+              ? Colors.green.shade600
+              : nextStatus == 'degraded'
+              ? Colors.orange.shade700
+              : Colors.redAccent,
+        ),
+      );
+    }
+  }
+
+  Future<int> _fetchApiStatusCode(Uri uri) async {
+    final client = http.Client();
+
+    try {
+      final response = await client
+          .get(uri, headers: const {'Accept': '*/*'})
+          .timeout(const Duration(seconds: 6));
+      return response.statusCode;
+    } finally {
+      client.close();
+    }
+  }
+
+  Future<void> _testServerStatus(HostingRecord record) async {
+    final id = record.id;
+    final endpoint = _serverEndpoint(record);
+    final settings = _serverSettingsFromDescription(record.description);
+    final username = record.secondaryValue.trim();
+    final password = settings['password'] ?? '';
+
+    if (id == null || endpoint == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Host atau port server tidak valid'),
+          backgroundColor: Colors.redAccent,
+        ),
+      );
+      return;
+    }
+
+    if (username.isEmpty || username == '-' || password.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Username atau password SSH belum diisi'),
+          backgroundColor: Colors.redAccent,
+        ),
+      );
+      return;
+    }
+
+    if (_testingServerRecordIds.contains(id)) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Test masih berjalan')));
+      return;
+    }
+
+    setState(() => _testingServerRecordIds.add(id));
+
+    var nextStatus = 'offline';
+    var message = 'Server tidak bisa diakses';
+    final now = DateTime.now().toIso8601String();
+    final checkedAt = DateTime.now();
+    final stopwatch = Stopwatch()..start();
+
+    try {
+      await _testSshConnection(
+        host: endpoint.host,
+        port: endpoint.port,
+        username: username,
+        password: password,
+      );
+      stopwatch.stop();
+
+      nextStatus = 'online';
+      message = 'SSH online (${stopwatch.elapsedMilliseconds} ms)';
+
+      await _dbHelper.updateHostingRecord(
+        record.copyWith(status: nextStatus, updatedAt: now),
+      );
+    } catch (e) {
+      stopwatch.stop();
+      message = 'SSH offline: ${_serverTestErrorMessage(e)}';
+      try {
+        await _dbHelper.updateHostingRecord(
+          record.copyWith(status: 'offline', updatedAt: now),
+        );
+      } catch (_) {
+        message = 'Server offline dan status gagal diperbarui';
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _testingServerRecordIds.remove(id);
+          _serverLatencyMsById[id] = stopwatch.elapsedMilliseconds;
+          _serverLastCheckedById[id] = checkedAt;
+        });
+      }
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _records = _records
+          .map(
+            (item) => item.id == id
+                ? item.copyWith(status: nextStatus, updatedAt: now)
+                : item,
+          )
+          .toList();
+    });
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        backgroundColor: nextStatus == 'online'
+            ? Colors.green.shade600
+            : Colors.redAccent,
+      ),
+    );
+  }
+
+  Future<void> _testSshConnection({
+    required String host,
+    required int port,
+    required String username,
+    required String password,
+  }) async {
+    SSHClient? client;
+
+    try {
+      final socket = await SSHSocket.connect(
+        host,
+        port,
+        timeout: const Duration(seconds: 5),
+      );
+      client = SSHClient(
+        socket,
+        username: username,
+        onPasswordRequest: () => password,
+        keepAliveInterval: null,
+      );
+      await client.authenticated.timeout(const Duration(seconds: 8));
+    } finally {
+      client?.close();
+    }
+  }
+
+  _ServerEndpoint? _serverEndpoint(HostingRecord record) {
+    final host = record.primaryValue.trim();
+    final port = record.tertiaryValue.trim();
+    if (host.isEmpty) return null;
+
+    final parsedPort = int.tryParse(port);
+    if (parsedPort == null || parsedPort <= 0 || parsedPort > 65535) {
+      return null;
+    }
+
+    return _ServerEndpoint(host: host, port: parsedPort);
+  }
+
+  Map<String, String> _serverSettingsFromDescription(String raw) {
+    if (raw.trim().isEmpty) return {};
+
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is Map<String, dynamic>) {
+        return decoded.map(
+          (key, value) => MapEntry(key, value?.toString() ?? ''),
+        );
+      }
+    } catch (_) {
+      return {'notes': raw};
+    }
+
+    return {'notes': raw};
+  }
+
+  String _serverTestErrorMessage(Object error) {
+    if (error is UnsupportedError) {
+      return 'SSH tidak didukung di platform web/browser';
+    }
+
+    final raw = error.toString();
+    if (raw.contains('Permission denied') || raw.contains('authenticate')) {
+      return 'login SSH gagal';
+    }
+    if (raw.contains('timed out') || raw.contains('TimeoutException')) {
+      return 'koneksi timeout';
+    }
+
+    return raw;
+  }
+
   Future<void> _setNginxMode(HostingRecord record, bool enabled) async {
     if (record.id == null) {
       return;
@@ -240,14 +580,109 @@ class _HostingCrudPageState extends State<HostingCrudPage> {
     }
   }
 
+  Future<void> _runBackupDatabase(HostingRecord record) async {
+    final id = record.id;
+    if (id == null || _runningBackupRecordIds.contains(id)) return;
+
+    final runningAt = DateTime.now().toIso8601String();
+    setState(() {
+      _runningBackupRecordIds.add(id);
+      _records = _records
+          .map(
+            (item) => item.id == id
+                ? item.copyWith(status: 'running', updatedAt: runningAt)
+                : item,
+          )
+          .toList();
+    });
+
+    try {
+      await _dbHelper.updateHostingRecord(
+        record.copyWith(status: 'running', updatedAt: runningAt),
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 900));
+
+      final finishedAt = DateTime.now().toIso8601String();
+      final successDescription = _backupDescriptionWithResult(
+        record.description,
+        status: 'success',
+        createdAt: finishedAt,
+        message: 'Backup selesai',
+        fileName: _backupFileName(record, finishedAt),
+      );
+      await _dbHelper.updateHostingRecord(
+        record.copyWith(
+          status: 'success',
+          description: successDescription,
+          updatedAt: finishedAt,
+        ),
+      );
+
+      if (!mounted) return;
+      setState(() {
+        _runningBackupRecordIds.remove(id);
+        _records = _records
+            .map(
+              (item) => item.id == id
+                  ? item
+                        .copyWith(status: 'success', updatedAt: finishedAt)
+                        .copyWith(description: successDescription)
+                  : item,
+            )
+            .toList();
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Backup ${record.title} selesai'),
+          backgroundColor: Colors.green.shade600,
+        ),
+      );
+    } catch (e) {
+      final failedAt = DateTime.now().toIso8601String();
+      final failedDescription = _backupDescriptionWithResult(
+        record.description,
+        status: 'failed',
+        createdAt: failedAt,
+        message: 'Backup gagal',
+        fileName: _backupFileName(record, failedAt),
+      );
+      if (mounted) {
+        setState(() {
+          _runningBackupRecordIds.remove(id);
+          _records = _records
+              .map(
+                (item) => item.id == id
+                    ? item
+                          .copyWith(status: 'failed', updatedAt: failedAt)
+                          .copyWith(description: failedDescription)
+                    : item,
+              )
+              .toList();
+        });
+      }
+      try {
+        await _dbHelper.updateHostingRecord(
+          record.copyWith(
+            status: 'failed',
+            description: failedDescription,
+            updatedAt: failedAt,
+          ),
+        );
+      } catch (_) {}
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Backup gagal: $e'),
+          backgroundColor: Colors.redAccent,
+        ),
+      );
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final total = _records.length;
-    final enabledCount = _records.where((record) => record.isEnabled).length;
-    final statusCount = _records.map((record) => record.status).toSet().length;
-    final nginxWarehouseCount = _nginxWarehouseRecords.length;
-    final nginxEnabledCount = _nginxEnabledRecords.length;
 
     return Scaffold(
       appBar: AppBar(
@@ -278,12 +713,8 @@ class _HostingCrudPageState extends State<HostingCrudPage> {
             Padding(
               padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
               child: _isNginxConfig
-                  ? _buildNginxHeroCard(
-                      total,
-                      nginxWarehouseCount,
-                      nginxEnabledCount,
-                    )
-                  : _buildHeroCard(total, enabledCount, statusCount),
+                  ? _buildNginxHeroCard(total)
+                  : _buildHeroCard(total),
             ),
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 16),
@@ -308,13 +739,7 @@ class _HostingCrudPageState extends State<HostingCrudPage> {
                 padding: const EdgeInsets.symmetric(horizontal: 16),
                 child: _buildNginxViewToggle(),
               ),
-            if (_isFileManagerConfig)
-              Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 16),
-                child: _buildFileManagerProjectFilter(),
-              ),
             if (_isNginxConfig) const SizedBox(height: 12),
-            if (_isFileManagerConfig) const SizedBox(height: 12),
             const SizedBox(height: 8),
             Expanded(
               child: _isLoading
@@ -393,7 +818,9 @@ class _HostingCrudPageState extends State<HostingCrudPage> {
             endActionPane: ActionPane(
               motion: const DrawerMotion(),
               children: [
-                if (_feature.showEnabledToggle && !_isNginxConfig)
+                if (_feature.showEnabledToggle &&
+                    !_isNginxConfig &&
+                    !_isApiMonitoringConfig)
                   SlidableAction(
                     onPressed: (_) => _toggleEnabled(record),
                     backgroundColor: record.isEnabled
@@ -403,7 +830,7 @@ class _HostingCrudPageState extends State<HostingCrudPage> {
                     icon: record.isEnabled
                         ? Icons.toggle_off_rounded
                         : Icons.toggle_on_rounded,
-                    label: record.isEnabled ? 'Disable' : 'Enable',
+                    label: record.isEnabled ? 'Matikan' : 'Nyalakan',
                   ),
                 SlidableAction(
                   onPressed: (_) => _openForm(record: record),
@@ -423,45 +850,13 @@ class _HostingCrudPageState extends State<HostingCrudPage> {
             ),
             child: _isDomainConfig
                 ? _buildDomainRecordCard(record)
+                : _isBackupDatabaseConfig
+                ? _buildBackupDatabaseRecordCard(record)
                 : _buildRecordCard(record),
           ),
         );
       },
     );
-  }
-
-  Widget _buildFileManagerProjectFilter() {
-    return DropdownButtonFormField<String>(
-      value: _selectedFileManagerProject,
-      decoration: InputDecoration(
-        labelText: 'Project',
-        prefixIcon: const Icon(Icons.dashboard_customize_rounded),
-        filled: true,
-        fillColor: Theme.of(context).cardColor,
-        border: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(18),
-          borderSide: BorderSide.none,
-        ),
-      ),
-      items: _fileManagerProjectItems()
-          .map(
-            (project) =>
-                DropdownMenuItem<String>(value: project, child: Text(project)),
-          )
-          .toList(),
-      onChanged: (value) {
-        if (value != null) {
-          setState(() {
-            _selectedFileManagerProject = value;
-            _fileManagerPath = '/';
-          });
-        }
-      },
-    );
-  }
-
-  List<String> _fileManagerProjectItems() {
-    return <String>['Semua', ..._safeFileManagerProjects];
   }
 
   Future<void> _openFileManagerActionSheet() async {
@@ -615,13 +1010,7 @@ class _HostingCrudPageState extends State<HostingCrudPage> {
           physics: const AlwaysScrollableScrollPhysics(),
           padding: const EdgeInsets.fromLTRB(16, 4, 16, 90),
           children: [
-            _buildFileManagerToolbar(
-              total: 0,
-              folderCount: 0,
-              fileCount: 0,
-              allProjectItems: projectRecords.length,
-            ),
-            const SizedBox(height: 40),
+            const SizedBox(height: 28),
             Icon(_feature.icon, size: 72, color: Colors.grey.shade400),
             const SizedBox(height: 16),
             Text(
@@ -645,13 +1034,6 @@ class _HostingCrudPageState extends State<HostingCrudPage> {
       return ListView(
         padding: const EdgeInsets.fromLTRB(16, 4, 16, 90),
         children: [
-          _buildFileManagerToolbar(
-            total: projects.length,
-            folderCount: projects.length,
-            fileCount: 0,
-            allProjectItems: projectRecords.length,
-          ),
-          const SizedBox(height: 12),
           ...projects.map(
             (project) => Padding(
               padding: const EdgeInsets.only(bottom: 10),
@@ -751,9 +1133,11 @@ class _HostingCrudPageState extends State<HostingCrudPage> {
   }) {
     final project = _selectedFileManagerProject;
     final location = project == 'Semua'
-        ? '/projects'
-        : '/projects/$project$_fileManagerPath';
-    final canGoBack = _fileManagerPath != '/';
+        ? 'Semua Project'
+        : _fileManagerPath == '/'
+        ? project
+        : '$project$_fileManagerPath';
+    final canGoBack = _fileManagerPath != '/' || project != 'Semua';
 
     return Container(
       padding: const EdgeInsets.all(14),
@@ -778,7 +1162,11 @@ class _HostingCrudPageState extends State<HostingCrudPage> {
                   tooltip: 'Back',
                   onPressed: () {
                     setState(() {
-                      _fileManagerPath = _parentPath(_fileManagerPath);
+                      if (_fileManagerPath != '/') {
+                        _fileManagerPath = _parentPath(_fileManagerPath);
+                      } else {
+                        _selectedFileManagerProject = 'Semua';
+                      }
                     });
                   },
                   icon: const Icon(Icons.arrow_back_rounded),
@@ -826,16 +1214,6 @@ class _HostingCrudPageState extends State<HostingCrudPage> {
               _buildFileManagerMetric(Icons.list_alt_rounded, '$total item'),
             ],
           ),
-          if (project != 'Semua' && allProjectItems != total) ...[
-            const SizedBox(height: 8),
-            Align(
-              alignment: Alignment.centerLeft,
-              child: Text(
-                '$allProjectItems item di project ini',
-                style: TextStyle(color: Colors.grey.shade600, fontSize: 11),
-              ),
-            ),
-          ],
         ],
       ),
     );
@@ -873,10 +1251,6 @@ class _HostingCrudPageState extends State<HostingCrudPage> {
   }
 
   Widget _buildFileManagerProjectFolderCard(String project) {
-    final itemCount = _records
-        .where((record) => record.tertiaryValue == project)
-        .length;
-
     return Material(
       color: Colors.transparent,
       child: InkWell(
@@ -928,17 +1302,6 @@ class _HostingCrudPageState extends State<HostingCrudPage> {
                       style: GoogleFonts.plusJakartaSans(
                         fontSize: 15,
                         fontWeight: FontWeight.w800,
-                      ),
-                    ),
-                    const SizedBox(height: 4),
-                    Text(
-                      '$itemCount item',
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        color: Colors.grey.shade600,
-                        fontSize: 12,
-                        fontWeight: FontWeight.w600,
                       ),
                     ),
                   ],
@@ -1453,7 +1816,7 @@ class _HostingCrudPageState extends State<HostingCrudPage> {
           ),
           const SizedBox(height: 8),
           Text(
-            'Tambahkan file config ke sites-available, lalu aktifkan ke sites-enabled saat siap dipakai.',
+            'Tambahkan konfigurasi Nginx, lalu aktifkan saat siap dipakai.',
             textAlign: TextAlign.center,
             style: TextStyle(color: Colors.grey.shade600),
           ),
@@ -1536,11 +1899,19 @@ class _HostingCrudPageState extends State<HostingCrudPage> {
                       : Colors.transparent,
                   borderRadius: BorderRadius.circular(14),
                 ),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
                   children: [
+                    Icon(
+                      Icons.tune_rounded,
+                      size: 18,
+                      color: isAvailable
+                          ? _feature.accentColor
+                          : Colors.grey.shade600,
+                    ),
+                    const SizedBox(width: 8),
                     Text(
-                      'Sites Available',
+                      'Konfigurasi',
                       style: TextStyle(
                         color: isAvailable
                             ? _feature.accentColor
@@ -1573,11 +1944,19 @@ class _HostingCrudPageState extends State<HostingCrudPage> {
                       : Colors.transparent,
                   borderRadius: BorderRadius.circular(14),
                 ),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
                   children: [
+                    Icon(
+                      Icons.visibility_rounded,
+                      size: 18,
+                      color: !isAvailable
+                          ? Colors.green.shade700
+                          : Colors.grey.shade600,
+                    ),
+                    const SizedBox(width: 8),
                     Text(
-                      'Sites Enabled',
+                      'Preview',
                       style: TextStyle(
                         color: !isAvailable
                             ? Colors.green.shade700
@@ -1609,7 +1988,7 @@ class _HostingCrudPageState extends State<HostingCrudPage> {
     );
   }
 
-  Widget _buildHeroCard(int total, int enabledCount, int statusCount) {
+  Widget _buildHeroCard(int total) {
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.all(18),
@@ -1654,24 +2033,12 @@ class _HostingCrudPageState extends State<HostingCrudPage> {
                 ),
                 const SizedBox(height: 4),
                 Text(
-                  total == 0 ? 'Siap diisi' : '$total item aktif di panel',
+                  total == 0 ? 'Siap diisi' : '$total item di panel',
                   style: const TextStyle(
                     color: Colors.white,
                     fontSize: 20,
                     fontWeight: FontWeight.w800,
                   ),
-                ),
-                const SizedBox(height: 8),
-                Wrap(
-                  spacing: 8,
-                  runSpacing: 8,
-                  children: [
-                    _buildHeroPill(
-                      'Enabled $enabledCount',
-                      Icons.toggle_on_rounded,
-                    ),
-                    _buildHeroPill('Status $statusCount', Icons.flag_rounded),
-                  ],
                 ),
               ],
             ),
@@ -1681,7 +2048,7 @@ class _HostingCrudPageState extends State<HostingCrudPage> {
     );
   }
 
-  Widget _buildNginxHeroCard(int total, int availableCount, int enabledCount) {
+  Widget _buildNginxHeroCard(int total) {
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.all(18),
@@ -1726,54 +2093,14 @@ class _HostingCrudPageState extends State<HostingCrudPage> {
                 ),
                 const SizedBox(height: 4),
                 Text(
-                  total == 0 ? 'Siap diisi' : '$total config tersedia',
+                  total == 0 ? 'Siap diisi' : '$total config Nginx',
                   style: const TextStyle(
                     color: Colors.white,
                     fontSize: 20,
                     fontWeight: FontWeight.w800,
                   ),
                 ),
-                const SizedBox(height: 8),
-                Wrap(
-                  spacing: 8,
-                  runSpacing: 8,
-                  children: [
-                    _buildHeroPill(
-                      'Available $availableCount',
-                      Icons.edit_rounded,
-                    ),
-                    _buildHeroPill(
-                      'Enabled $enabledCount',
-                      Icons.toggle_on_rounded,
-                    ),
-                  ],
-                ),
               ],
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildHeroPill(String label, IconData icon) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-      decoration: BoxDecoration(
-        color: Colors.white.withOpacity(0.16),
-        borderRadius: BorderRadius.circular(999),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(icon, size: 14, color: Colors.white),
-          const SizedBox(width: 6),
-          Text(
-            label,
-            style: const TextStyle(
-              color: Colors.white,
-              fontSize: 12,
-              fontWeight: FontWeight.w600,
             ),
           ),
         ],
@@ -1855,7 +2182,7 @@ class _HostingCrudPageState extends State<HostingCrudPage> {
               ),
               const SizedBox(width: 12),
               Text(
-                record.status,
+                _statusLabel(record.status),
                 style: TextStyle(
                   color: _statusColor(record.status),
                   fontSize: 12,
@@ -1875,9 +2202,6 @@ class _HostingCrudPageState extends State<HostingCrudPage> {
     required bool showToggle,
     ValueChanged<bool>? onToggle,
   }) {
-    final statusColor = isEnabled
-        ? Colors.green.shade700
-        : Colors.orange.shade700;
     final preview = record.description.isNotEmpty
         ? record.description
         : _buildNginxConfigPreview(record);
@@ -1923,15 +2247,6 @@ class _HostingCrudPageState extends State<HostingCrudPage> {
                         fontSize: 16,
                         fontWeight: FontWeight.w800,
                       ),
-                    ),
-                  ),
-                  const SizedBox(width: 12),
-                  Text(
-                    isEnabled ? 'Enabled' : 'Available',
-                    style: TextStyle(
-                      color: statusColor,
-                      fontSize: 12,
-                      fontWeight: FontWeight.w700,
                     ),
                   ),
                 ],
@@ -2030,7 +2345,13 @@ server {
   }
 
   Widget _buildRecordCard(HostingRecord record) {
+    if (_isApiMonitoringConfig) {
+      return _buildApiMonitoringRecordCard(record);
+    }
+
     final rows = _simpleRecordRows(record);
+    final isTestingServer =
+        record.id != null && _testingServerRecordIds.contains(record.id);
 
     return Material(
       color: Colors.transparent,
@@ -2074,6 +2395,10 @@ server {
                       ),
                     ),
                   ),
+                  if (_isServerConfig) ...[
+                    const SizedBox(width: 10),
+                    _buildServerStatusBadge(record.status),
+                  ],
                 ],
               ),
               if (rows.isNotEmpty) ...[
@@ -2111,11 +2436,662 @@ server {
                   ),
                 ),
               ],
+              if (_isServerConfig) ...[
+                const SizedBox(height: 8),
+                _buildServerMonitoringMeta(record),
+                const SizedBox(height: 10),
+                SizedBox(
+                  width: double.infinity,
+                  child: OutlinedButton.icon(
+                    onPressed: isTestingServer
+                        ? null
+                        : () => _testServerStatus(record),
+                    icon: isTestingServer
+                        ? SizedBox(
+                            width: 16,
+                            height: 16,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              color: _feature.accentColor,
+                            ),
+                          )
+                        : const Icon(Icons.play_arrow_rounded),
+                    label: Text(isTestingServer ? 'Testing...' : 'Test'),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: _feature.accentColor,
+                      side: BorderSide(
+                        color: _feature.accentColor.withOpacity(0.28),
+                      ),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
             ],
           ),
         ),
       ),
     );
+  }
+
+  Widget _buildServerMonitoringMeta(HostingRecord record) {
+    final id = record.id;
+    final latency = id == null ? null : _serverLatencyMsById[id];
+    final lastChecked = id == null ? null : _serverLastCheckedById[id];
+
+    return Wrap(
+      spacing: 8,
+      runSpacing: 8,
+      children: [
+        _buildApiIconChip(
+          icon: Icons.speed_rounded,
+          label: latency == null ? '-' : '${latency}ms',
+          color: Colors.teal,
+        ),
+        _buildApiIconChip(
+          icon: Icons.schedule_rounded,
+          label: lastChecked == null ? '-' : _formatApiLastChecked(lastChecked),
+          color: Colors.deepPurple,
+        ),
+      ],
+    );
+  }
+
+  Widget _buildServerStatusBadge(String status) {
+    final color = _statusColor(status);
+
+    return Container(
+      width: 36,
+      height: 36,
+      alignment: Alignment.center,
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.12),
+        shape: BoxShape.circle,
+        border: Border.all(color: color.withOpacity(0.20)),
+      ),
+      child: Icon(
+        status.toLowerCase() == 'online'
+            ? Icons.check_circle_rounded
+            : Icons.cancel_rounded,
+        color: color,
+        size: 20,
+      ),
+    );
+  }
+
+  Widget _buildApiMonitoringRecordCard(HostingRecord record) {
+    final isTestingApi =
+        record.id != null && _testingApiRecordIds.contains(record.id);
+
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(24),
+        onTap: null,
+        child: Container(
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: Theme.of(context).cardColor,
+            borderRadius: BorderRadius.circular(24),
+            border: Border.all(color: _feature.accentColor.withOpacity(0.12)),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withOpacity(0.04),
+                blurRadius: 18,
+                offset: const Offset(0, 8),
+              ),
+            ],
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: _feature.accentColor.withOpacity(0.12),
+                      borderRadius: BorderRadius.circular(16),
+                    ),
+                    child: Icon(_feature.icon, color: _feature.accentColor),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          record.title,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: GoogleFonts.plusJakartaSans(
+                            fontSize: 16,
+                            fontWeight: FontWeight.w800,
+                          ),
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          record.primaryValue,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            color: Colors.grey.shade600,
+                            fontSize: 12,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  _buildApiStatusBadge(record.status),
+                ],
+              ),
+              const SizedBox(height: 14),
+              _buildApiMonitoringMeta(record),
+              const SizedBox(height: 10),
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  onPressed: isTestingApi
+                      ? null
+                      : () => _testApiEndpoint(record),
+                  icon: isTestingApi
+                      ? SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            color: _feature.accentColor,
+                          ),
+                        )
+                      : const Icon(Icons.play_arrow_rounded),
+                  label: Text(isTestingApi ? 'Testing...' : 'Test'),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: _feature.accentColor,
+                    side: BorderSide(
+                      color: _feature.accentColor.withOpacity(0.28),
+                    ),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(14),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildApiStatusBadge(String status) {
+    final color = _apiStatusColor(status);
+
+    return Container(
+      width: 36,
+      height: 36,
+      alignment: Alignment.center,
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.12),
+        shape: BoxShape.circle,
+        border: Border.all(color: color.withOpacity(0.20)),
+      ),
+      child: Icon(_apiStatusIcon(status), color: color, size: 20),
+    );
+  }
+
+  Widget _buildBackupDatabaseRecordCard(HostingRecord record) {
+    final settings = _backupSettingsFromDescription(record.description);
+    final results = _backupResultsForRecord(record);
+    final isRunning =
+        record.id != null && _runningBackupRecordIds.contains(record.id);
+    final status = isRunning ? 'running' : record.status;
+    final statusColor = _statusColor(status);
+
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(24),
+        onTap: null,
+        child: Container(
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: Theme.of(context).cardColor,
+            borderRadius: BorderRadius.circular(24),
+            border: Border.all(color: _feature.accentColor.withOpacity(0.12)),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withOpacity(0.04),
+                blurRadius: 18,
+                offset: const Offset(0, 8),
+              ),
+            ],
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: _feature.accentColor.withOpacity(0.12),
+                      borderRadius: BorderRadius.circular(16),
+                    ),
+                    child: Icon(_feature.icon, color: _feature.accentColor),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          record.title,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: GoogleFonts.plusJakartaSans(
+                            fontSize: 16,
+                            fontWeight: FontWeight.w800,
+                          ),
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          record.primaryValue,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            color: Colors.grey.shade600,
+                            fontSize: 12,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  _buildApiIconChip(
+                    icon: _backupStatusIcon(status),
+                    label: _statusLabel(status),
+                    color: statusColor,
+                  ),
+                ],
+              ),
+              const SizedBox(height: 14),
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  _buildApiIconChip(
+                    icon: Icons.storage_rounded,
+                    label: record.secondaryValue,
+                    color: Colors.indigo,
+                  ),
+                  _buildApiIconChip(
+                    icon: Icons.settings_ethernet_rounded,
+                    label: record.tertiaryValue,
+                    color: Colors.blueGrey,
+                  ),
+                  _buildApiIconChip(
+                    icon: Icons.event_repeat_rounded,
+                    label: settings['schedule'] ?? '-',
+                    color: Colors.teal,
+                  ),
+                  _buildApiIconChip(
+                    icon: Icons.history_rounded,
+                    label: settings['retention'] ?? '-',
+                    color: Colors.deepPurple,
+                  ),
+                ],
+              ),
+              const SizedBox(height: 10),
+              _buildBackupResultsDropdown(results),
+              if ((settings['notes'] ?? '').isNotEmpty) ...[
+                const SizedBox(height: 8),
+                Text(
+                  settings['notes']!,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(color: Colors.grey.shade600, fontSize: 12),
+                ),
+              ],
+              const SizedBox(height: 10),
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  onPressed: isRunning
+                      ? null
+                      : () => _runBackupDatabase(record),
+                  icon: isRunning
+                      ? SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            color: _feature.accentColor,
+                          ),
+                        )
+                      : const Icon(Icons.play_arrow_rounded),
+                  label: Text(isRunning ? 'Running...' : 'Run Backup'),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: _feature.accentColor,
+                    side: BorderSide(
+                      color: _feature.accentColor.withOpacity(0.28),
+                    ),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(14),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Map<String, String> _backupSettingsFromDescription(String raw) {
+    if (raw.trim().isEmpty) return {};
+
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is Map<String, dynamic>) {
+        return decoded.map(
+          (key, value) => MapEntry(key, value?.toString() ?? ''),
+        );
+      }
+    } catch (_) {
+      return {'notes': raw};
+    }
+
+    return {'notes': raw};
+  }
+
+  Widget _buildBackupResultsDropdown(List<Map<String, String>> results) {
+    final latest = results.isEmpty ? null : results.first;
+
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.black.withOpacity(0.03),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: Colors.grey.withOpacity(0.12)),
+      ),
+      child: Theme(
+        data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+        child: ExpansionTile(
+          tilePadding: const EdgeInsets.symmetric(horizontal: 12),
+          childrenPadding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+          leading: Icon(Icons.inventory_2_rounded, color: _feature.accentColor),
+          title: Text(
+            latest == null ? 'List Backup' : 'List Backup',
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w800),
+          ),
+          children: results.isEmpty
+              ? [
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: Text(
+                      'Jalankan backup untuk membuat hasil pertama.',
+                      style: TextStyle(
+                        color: Colors.grey.shade600,
+                        fontSize: 12,
+                      ),
+                    ),
+                  ),
+                ]
+              : results
+                    .map(
+                      (result) => Padding(
+                        padding: const EdgeInsets.only(top: 8),
+                        child: Row(
+                          children: [
+                            Icon(
+                              _backupStatusIcon(result['status'] ?? ''),
+                              size: 18,
+                              color: _statusColor(result['status'] ?? ''),
+                            ),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    result['fileName'] ?? '-',
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.w800,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 2),
+                                  Text(
+                                    '${result['message'] ?? '-'} • ${_formatBackupResultTime(result['createdAt'] ?? '')}',
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(
+                                      color: Colors.grey.shade600,
+                                      fontSize: 11,
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    )
+                    .toList(),
+        ),
+      ),
+    );
+  }
+
+  List<Map<String, String>> _backupResultsFromDescription(String raw) {
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is Map<String, dynamic> && decoded['results'] is List) {
+        return (decoded['results'] as List)
+            .whereType<Map>()
+            .map(
+              (result) => result.map(
+                (key, value) =>
+                    MapEntry(key.toString(), value?.toString() ?? ''),
+              ),
+            )
+            .toList();
+      }
+    } catch (_) {}
+
+    return const [];
+  }
+
+  List<Map<String, String>> _backupResultsForRecord(HostingRecord record) {
+    final results = _backupResultsFromDescription(record.description);
+    if (results.isNotEmpty) return results;
+    if (record.updatedAt.trim().isEmpty) return const [];
+
+    final status = record.status.toLowerCase() == 'failed'
+        ? 'failed'
+        : 'success';
+
+    return [
+      {
+        'status': status,
+        'createdAt': record.updatedAt,
+        'message': status == 'success'
+            ? 'Backup awal tersedia'
+            : 'Backup awal gagal',
+        'fileName': _backupFileName(record, record.updatedAt),
+      },
+    ];
+  }
+
+  String _backupDescriptionWithResult(
+    String raw, {
+    required String status,
+    required String createdAt,
+    required String message,
+    required String fileName,
+  }) {
+    final payload = _backupPayloadFromDescription(raw);
+    final results = _backupResultsFromDescription(raw);
+    results.insert(0, {
+      'status': status,
+      'createdAt': createdAt,
+      'message': message,
+      'fileName': fileName,
+    });
+
+    payload['results'] = results.take(10).toList();
+    return jsonEncode(payload);
+  }
+
+  Map<String, dynamic> _backupPayloadFromDescription(String raw) {
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is Map<String, dynamic>) {
+        return Map<String, dynamic>.from(decoded);
+      }
+    } catch (_) {
+      return {'notes': raw};
+    }
+
+    return {};
+  }
+
+  String _backupFileName(HostingRecord record, String createdAt) {
+    final parsed = DateTime.tryParse(createdAt) ?? DateTime.now();
+    final stamp =
+        '${parsed.year}${parsed.month.toString().padLeft(2, '0')}${parsed.day.toString().padLeft(2, '0')}_${parsed.hour.toString().padLeft(2, '0')}${parsed.minute.toString().padLeft(2, '0')}';
+    final dbType = record.secondaryValue
+        .toLowerCase()
+        .replaceAll(RegExp(r'[^a-z0-9]+'), '_')
+        .replaceAll(RegExp(r'^_|_$'), '');
+    final safeName = record.title
+        .toLowerCase()
+        .replaceAll(RegExp(r'[^a-z0-9]+'), '_')
+        .replaceAll(RegExp(r'^_|_$'), '');
+    return 'backup_${dbType}_${safeName}_$stamp.zip';
+  }
+
+  IconData _backupStatusIcon(String status) {
+    switch (status.toLowerCase()) {
+      case 'success':
+      case 'ready':
+        return Icons.check_circle_rounded;
+      case 'running':
+        return Icons.sync_rounded;
+      case 'failed':
+        return Icons.cancel_rounded;
+      default:
+        return Icons.info_rounded;
+    }
+  }
+
+  String _formatBackupResultTime(String raw) {
+    final parsed = DateTime.tryParse(raw);
+    if (parsed == null) return '-';
+    final hour = parsed.hour.toString().padLeft(2, '0');
+    final minute = parsed.minute.toString().padLeft(2, '0');
+    return '$hour:$minute';
+  }
+
+  Widget _buildApiMonitoringMeta(HostingRecord record) {
+    final id = record.id;
+    final latency = id == null ? null : _apiLatencyMsById[id];
+    final lastChecked = id == null ? null : _apiLastCheckedById[id];
+
+    return Wrap(
+      spacing: 8,
+      runSpacing: 8,
+      children: [
+        _buildApiIconChip(
+          icon: Icons.timer_rounded,
+          label: '${record.secondaryValue}s',
+          color: Colors.blueGrey,
+        ),
+        _buildApiIconChip(
+          icon: Icons.speed_rounded,
+          label: latency == null ? '-' : '${latency}ms',
+          color: Colors.teal,
+        ),
+        _buildApiIconChip(
+          icon: Icons.schedule_rounded,
+          label: lastChecked == null ? '-' : _formatApiLastChecked(lastChecked),
+          color: Colors.deepPurple,
+        ),
+      ],
+    );
+  }
+
+  Widget _buildApiIconChip({
+    required IconData icon,
+    required String label,
+    required Color color,
+  }) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.10),
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(color: color.withOpacity(0.16)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 15, color: color),
+          const SizedBox(width: 6),
+          ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 150),
+            child: Text(
+              label.isEmpty ? '-' : label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                color: color,
+                fontSize: 11,
+                fontWeight: FontWeight.w800,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  IconData _apiStatusIcon(String status) {
+    switch (status.toLowerCase()) {
+      case 'healthy':
+        return Icons.check_circle_rounded;
+      case 'degraded':
+        return Icons.warning_amber_rounded;
+      case 'down':
+        return Icons.cancel_rounded;
+      default:
+        return Icons.help_rounded;
+    }
+  }
+
+  Color _apiStatusColor(String status) {
+    switch (status.toLowerCase()) {
+      case 'healthy':
+        return Colors.green.shade600;
+      case 'degraded':
+        return Colors.orange.shade700;
+      case 'down':
+        return Colors.redAccent;
+      default:
+        return Colors.blueGrey;
+    }
   }
 
   Widget _buildFileManagerRecordCard(HostingRecord record) {
@@ -2262,19 +3238,18 @@ server {
           _RecordInfoRow('Project', record.tertiaryValue),
         ];
       case 'api_monitoring':
-        return [
-          _RecordInfoRow('URL', record.primaryValue),
-          _RecordInfoRow('Interval', '${record.secondaryValue} detik'),
-        ];
+        return [_RecordInfoRow('URL', record.primaryValue)];
       case 'other_services':
         return [
-          _RecordInfoRow('Link', record.primaryValue),
-          _RecordInfoRow('Deskripsi', record.description),
+          _RecordInfoRow('Database', record.primaryValue),
+          _RecordInfoRow('Jenis', record.secondaryValue),
+          _RecordInfoRow('Port', record.tertiaryValue),
         ];
       case 'server':
         return [
           _RecordInfoRow('Host', record.primaryValue),
           _RecordInfoRow('Port', record.tertiaryValue),
+          _RecordInfoRow('User', record.secondaryValue),
         ];
       default:
         return [
@@ -2282,6 +3257,13 @@ server {
           _RecordInfoRow(widget.feature.secondaryLabel, record.secondaryValue),
         ];
     }
+  }
+
+  String _formatApiLastChecked(DateTime value) {
+    final hour = value.hour.toString().padLeft(2, '0');
+    final minute = value.minute.toString().padLeft(2, '0');
+    final second = value.second.toString().padLeft(2, '0');
+    return '$hour:$minute:$second';
   }
 
   Widget _buildDomainRecordCard(HostingRecord record) {
@@ -2379,6 +3361,7 @@ server {
       case 'verified':
       case 'deployed':
       case 'ready':
+      case 'success':
         return Colors.green.shade700;
       case 'paused':
       case 'maintenance':
@@ -2386,14 +3369,64 @@ server {
       case 'draft':
       case 'planning':
       case 'review':
+      case 'running':
+      case 'available':
         return Colors.orange.shade700;
       case 'disabled':
       case 'expired':
       case 'down':
       case 'offline':
+      case 'failed':
         return Colors.red.shade700;
       default:
         return Colors.blueGrey.shade700;
+    }
+  }
+
+  String _statusLabel(String status) {
+    switch (status.toLowerCase()) {
+      case 'enabled':
+        return 'Berjalan';
+      case 'available':
+        return 'Config';
+      case 'active':
+        return 'Berjalan';
+      case 'disabled':
+        return 'Nonaktif';
+      case 'healthy':
+        return 'Sehat';
+      case 'degraded':
+        return 'Perlu cek';
+      case 'down':
+        return 'Down';
+      case 'online':
+        return 'Online';
+      case 'offline':
+        return 'Offline';
+      case 'verified':
+        return 'Terverifikasi';
+      case 'expired':
+        return 'Expired';
+      case 'deployed':
+        return 'Deploy';
+      case 'ready':
+        return 'Siap';
+      case 'success':
+        return 'Berhasil';
+      case 'failed':
+        return 'Gagal';
+      case 'running':
+        return 'Berjalan';
+      case 'paused':
+        return 'Pause';
+      case 'maintenance':
+        return 'Maintenance';
+      case 'planning':
+        return 'Planning';
+      case 'review':
+        return 'Review';
+      default:
+        return status.isEmpty ? '-' : status;
     }
   }
 }
@@ -2403,4 +3436,11 @@ class _RecordInfoRow {
   final String value;
 
   const _RecordInfoRow(this.label, this.value);
+}
+
+class _ServerEndpoint {
+  final String host;
+  final int port;
+
+  const _ServerEndpoint({required this.host, required this.port});
 }

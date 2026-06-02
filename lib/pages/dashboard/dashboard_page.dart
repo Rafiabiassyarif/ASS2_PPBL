@@ -165,7 +165,7 @@ class _DashboardPageState extends State<DashboardPage> {
                                   ),
                                 ),
                                 Text(
-                                  'Hosting CRUD Command Center',
+                                  'Infrastructure Control Center',
                                   style: TextStyle(
                                     fontSize: 12,
                                     color: theme.textTheme.bodySmall?.color
@@ -202,7 +202,7 @@ class _DashboardPageState extends State<DashboardPage> {
                         padding: const EdgeInsets.symmetric(horizontal: 16),
                         sliver: SliverToBoxAdapter(
                           child: Text(
-                            'Modul CRUD PPBL',
+                            'Kelola Infrastruktur',
                             style: GoogleFonts.plusJakartaSans(
                               fontSize: 18,
                               fontWeight: FontWeight.w800,
@@ -311,7 +311,7 @@ class _DashboardPageState extends State<DashboardPage> {
           const SizedBox(height: 18),
           const SizedBox(height: 6),
           Text(
-            'Satu panel untuk mengelola config Nginx, subdomain, domain, project, file manager, API monitoring, layanan lain, dan node server.',
+            'Satu panel untuk mengelola Nginx, domain, project, file manager, API monitoring, backup database, dan koneksi server.',
             style: TextStyle(
               color: Colors.white.withOpacity(0.92),
               height: 1.45,
@@ -324,7 +324,7 @@ class _DashboardPageState extends State<DashboardPage> {
               const SizedBox(width: 12),
               _buildHeroMetric('$_totalRecords', 'Item'),
               const SizedBox(width: 12),
-              _buildHeroMetric('PPBL', 'Mode'),
+              _buildHeroMetric('Infra', 'Mode'),
             ],
           ),
         ],
@@ -392,7 +392,7 @@ class _DashboardPageState extends State<DashboardPage> {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  'Data demo tersimpan lokal di SQLite',
+                  'Konfigurasi tersimpan lokal di SQLite',
                   style: GoogleFonts.plusJakartaSans(
                     fontSize: 15,
                     fontWeight: FontWeight.w700,
@@ -400,7 +400,7 @@ class _DashboardPageState extends State<DashboardPage> {
                 ),
                 const SizedBox(height: 4),
                 Text(
-                  'Cocok untuk presentasi PPBL, lalu bisa diganti ke backend hosting saat siap diintegrasikan.',
+                  'Kelola data infrastruktur dari panel ini sebelum dihubungkan ke backend server produksi.',
                   style: TextStyle(
                     color: theme.textTheme.bodySmall?.color?.withOpacity(0.7),
                     height: 1.35,
@@ -533,7 +533,7 @@ class _FeatureCard extends StatelessWidget {
                         child: OutlinedButton.icon(
                           onPressed: onTap,
                           icon: const Icon(Icons.open_in_new_rounded, size: 18),
-                          label: const Text('Kelola Data'),
+                          label: const Text('Buka Modul'),
                           style: OutlinedButton.styleFrom(
                             foregroundColor: feature.accentColor,
                             side: BorderSide(

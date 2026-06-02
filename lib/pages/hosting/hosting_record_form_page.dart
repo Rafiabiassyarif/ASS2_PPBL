@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:intl/intl.dart';
@@ -22,6 +24,10 @@ class _HostingRecordFormPageState extends State<HostingRecordFormPage> {
   final _secondaryController = TextEditingController();
   final _tertiaryController = TextEditingController();
   final _descriptionController = TextEditingController();
+  final _backupScheduleController = TextEditingController();
+  final _backupTargetController = TextEditingController();
+  final _backupRetentionController = TextEditingController();
+  final _serverPasswordController = TextEditingController();
   final DatabaseHelper _dbHelper = DatabaseHelper.instance;
 
   List<String>? _domainOptions;
@@ -37,6 +43,8 @@ class _HostingRecordFormPageState extends State<HostingRecordFormPage> {
   bool get _isDomainFeature => widget.feature.key == 'domain';
   bool get _isProjectFeature => widget.feature.key == 'project';
   bool get _isFileManagerFeature => widget.feature.key == 'file_manager';
+  bool get _isBackupDatabaseFeature => widget.feature.key == 'other_services';
+  bool get _isServerFeature => widget.feature.key == 'server';
   List<String> get _safeDomainOptions => _domainOptions ?? const [];
   List<String> get _safeProjectOptions => _projectOptions ?? const [];
 
@@ -69,6 +77,8 @@ class _HostingRecordFormPageState extends State<HostingRecordFormPage> {
           ? record!.tertiaryValue
           : null;
       _loadFileManagerProjectOptions();
+    } else if (_isServerFeature) {
+      _setServerInitialValues(record);
     } else {
       _titleController.text = record?.title ?? '';
       _primaryController.text = record?.primaryValue ?? '';
@@ -76,7 +86,36 @@ class _HostingRecordFormPageState extends State<HostingRecordFormPage> {
       _tertiaryController.text = record?.tertiaryValue ?? '';
     }
 
-    _descriptionController.text = record?.description ?? '';
+    if (_isBackupDatabaseFeature) {
+      _setBackupDatabaseInitialValues(record);
+    } else if (_isServerFeature) {
+      final settings = _serverSettingsFromDescription(
+        record?.description ?? '',
+      );
+      _descriptionController.text = settings['notes'] ?? '';
+    } else {
+      _descriptionController.text = record?.description ?? '';
+    }
+  }
+
+  void _setServerInitialValues(HostingRecord? record) {
+    final settings = _serverSettingsFromDescription(record?.description ?? '');
+
+    _titleController.text = record?.title ?? '';
+    _primaryController.text = record?.primaryValue ?? '';
+    _secondaryController.text = record?.secondaryValue == '-'
+        ? ''
+        : record?.secondaryValue ?? '';
+    _tertiaryController.text = record?.tertiaryValue ?? '22';
+    _serverPasswordController.text = settings['password'] ?? '';
+  }
+
+  void _setBackupDatabaseInitialValues(HostingRecord? record) {
+    final settings = _backupSettingsFromDescription(record?.description ?? '');
+    _backupScheduleController.text = settings['schedule'] ?? '02:00';
+    _backupTargetController.text = settings['target'] ?? '';
+    _backupRetentionController.text = settings['retention'] ?? 'Daily';
+    _descriptionController.text = settings['notes'] ?? '';
   }
 
   void _setNginxInitialValues(HostingRecord? record) {
@@ -153,12 +192,27 @@ class _HostingRecordFormPageState extends State<HostingRecordFormPage> {
     final subdomains = await _dbHelper.getHostingRecords(
       HostingFeatures.subdomain.key,
     );
+    final projects = await _dbHelper.getHostingRecords(
+      HostingFeatures.project.key,
+    );
     if (!mounted) return;
 
-    final options = <String>{
-      ...domains.map((record) => record.title.trim()),
-      ...subdomains.map((record) => record.title.trim()),
-    }.where((domain) => domain.isNotEmpty).toList()..sort();
+    final usedDomains = projects
+        .where((record) => record.id != widget.record?.id)
+        .map((record) => record.primaryValue.trim())
+        .where((domain) => domain.isNotEmpty)
+        .toSet();
+
+    final options =
+        <String>{
+              ...domains.map((record) => record.title.trim()),
+              ...subdomains.map((record) => record.title.trim()),
+            }
+            .where(
+              (domain) => domain.isNotEmpty && !usedDomains.contains(domain),
+            )
+            .toList()
+          ..sort();
 
     final selected = _selectedDomain;
     if (selected != null &&
@@ -172,6 +226,18 @@ class _HostingRecordFormPageState extends State<HostingRecordFormPage> {
       _domainOptions = options;
       _selectedDomain ??= options.isNotEmpty ? options.first : null;
     });
+  }
+
+  Future<bool> _isProjectDomainAvailable(String domain) async {
+    final projects = await _dbHelper.getHostingRecords(
+      HostingFeatures.project.key,
+    );
+
+    return !projects.any(
+      (record) =>
+          record.id != widget.record?.id &&
+          record.primaryValue.trim() == domain,
+    );
   }
 
   Future<void> _loadFileManagerProjectOptions() async {
@@ -209,6 +275,10 @@ class _HostingRecordFormPageState extends State<HostingRecordFormPage> {
     _secondaryController.dispose();
     _tertiaryController.dispose();
     _descriptionController.dispose();
+    _backupScheduleController.dispose();
+    _backupTargetController.dispose();
+    _backupRetentionController.dispose();
+    _serverPasswordController.dispose();
     super.dispose();
   }
 
@@ -229,6 +299,22 @@ class _HostingRecordFormPageState extends State<HostingRecordFormPage> {
         ),
       );
       return;
+    }
+
+    if (_isProjectFeature) {
+      final domainAvailable = await _isProjectDomainAvailable(selectedDomain);
+      if (!mounted) return;
+      if (!domainAvailable) {
+        setState(() => _isSaving = false);
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Domain sudah digunakan oleh project lain'),
+            backgroundColor: Colors.redAccent,
+          ),
+        );
+        _loadProjectDomainOptions();
+        return;
+      }
     }
 
     if (_isFileManagerFeature && (_selectedProject?.trim().isEmpty ?? true)) {
@@ -396,9 +482,9 @@ class _HostingRecordFormPageState extends State<HostingRecordFormPage> {
         return _SimpleFeatureValues(
           title: title,
           primary: primary,
-          secondary: secondary.isEmpty ? '-' : secondary,
+          secondary: secondary.isEmpty ? 'MySQL' : secondary,
           tertiary: tertiary.isEmpty ? '-' : tertiary,
-          description: description,
+          description: _backupSettingsDescription(),
           status: widget.feature.defaultStatus,
           isEnabled: false,
         );
@@ -406,11 +492,9 @@ class _HostingRecordFormPageState extends State<HostingRecordFormPage> {
         return _SimpleFeatureValues(
           title: title,
           primary: primary,
-          secondary: secondary.isEmpty ? '-' : secondary,
-          tertiary: tertiary,
-          description: description.isEmpty
-              ? 'Node server $title.'
-              : description,
+          secondary: secondary,
+          tertiary: tertiary.isEmpty ? '22' : tertiary,
+          description: _serverSettingsDescription(),
           status: widget.feature.defaultStatus,
           isEnabled: false,
         );
@@ -425,6 +509,105 @@ class _HostingRecordFormPageState extends State<HostingRecordFormPage> {
           isEnabled: widget.feature.showEnabledToggle,
         );
     }
+  }
+
+  Map<String, String> _backupSettingsFromDescription(String raw) {
+    if (raw.trim().isEmpty) return {};
+
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is Map<String, dynamic>) {
+        return decoded.map(
+          (key, value) => MapEntry(key, value?.toString() ?? ''),
+        );
+      }
+    } catch (_) {
+      return {'notes': raw};
+    }
+
+    return {'notes': raw};
+  }
+
+  String _serverSettingsDescription() {
+    return jsonEncode({
+      'password': _serverPasswordController.text.trim(),
+      'notes': _descriptionController.text.trim(),
+    });
+  }
+
+  Map<String, String> _serverSettingsFromDescription(String raw) {
+    if (raw.trim().isEmpty) return {};
+
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is Map<String, dynamic>) {
+        return decoded.map(
+          (key, value) => MapEntry(key, value?.toString() ?? ''),
+        );
+      }
+    } catch (_) {
+      return {'notes': raw};
+    }
+
+    return {'notes': raw};
+  }
+
+  String _backupSettingsDescription() {
+    final payload = <String, dynamic>{
+      'schedule': _backupScheduleController.text.trim(),
+      'target': _backupTargetController.text.trim().isEmpty
+          ? '/backups/database'
+          : _backupTargetController.text.trim(),
+      'retention': _backupRetentionController.text.trim(),
+      'notes': _descriptionController.text.trim(),
+    };
+
+    try {
+      final decoded = jsonDecode(widget.record?.description ?? '');
+      if (decoded is Map<String, dynamic> && decoded['results'] is List) {
+        payload['results'] = decoded['results'];
+      }
+    } catch (_) {}
+
+    return jsonEncode(payload);
+  }
+
+  Future<void> _pickBackupSchedule() async {
+    final initialTime = _timeOfDayFromText(_backupScheduleController.text);
+    final time = await showTimePicker(
+      context: context,
+      initialTime: initialTime,
+      initialEntryMode: TimePickerEntryMode.input,
+      builder: (context, child) {
+        return MediaQuery(
+          data: MediaQuery.of(context).copyWith(alwaysUse24HourFormat: true),
+          child: child ?? const SizedBox.shrink(),
+        );
+      },
+    );
+    if (time == null || !mounted) return;
+
+    setState(() {
+      _backupScheduleController.text =
+          '${time.hour.toString().padLeft(2, '0')}:${time.minute.toString().padLeft(2, '0')}';
+    });
+  }
+
+  TimeOfDay _timeOfDayFromText(String value) {
+    final parts = value.split(':');
+    if (parts.length == 2) {
+      final hour = int.tryParse(parts.first);
+      final minute = int.tryParse(parts.last);
+      if (hour != null &&
+          minute != null &&
+          hour >= 0 &&
+          hour < 24 &&
+          minute >= 0 &&
+          minute < 60) {
+        return TimeOfDay(hour: hour, minute: minute);
+      }
+    }
+    return const TimeOfDay(hour: 2, minute: 0);
   }
 
   @override
@@ -615,7 +798,7 @@ class _HostingRecordFormPageState extends State<HostingRecordFormPage> {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Sites Enabled'),
+        title: const Text('Preview Config'),
         backgroundColor: Colors.transparent,
         elevation: 0,
       ),
@@ -683,7 +866,7 @@ class _HostingRecordFormPageState extends State<HostingRecordFormPage> {
                           ),
                           const SizedBox(height: 6),
                           Text(
-                            'Config yang sudah aktif di sites-enabled tidak bisa diedit langsung. Ubah file asalnya di sites-available.',
+                            'Preview config bersifat read only. Ubah file konfigurasi asalnya terlebih dahulu.',
                             style: TextStyle(
                               color: Colors.white.withOpacity(0.9),
                               height: 1.35,
@@ -703,7 +886,7 @@ class _HostingRecordFormPageState extends State<HostingRecordFormPage> {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       const Text(
-                        'Info Config Aktif',
+                        'Detail Config',
                         style: TextStyle(
                           fontSize: 16,
                           fontWeight: FontWeight.w800,
@@ -737,7 +920,7 @@ class _HostingRecordFormPageState extends State<HostingRecordFormPage> {
                     ),
                   ),
                   icon: const Icon(Icons.arrow_back_rounded),
-                  label: const Text('Kembali ke Sites Available'),
+                  label: const Text('Kembali ke Konfigurasi'),
                 ),
               ),
             ],
@@ -994,31 +1177,104 @@ server {
           ),
         ];
       case 'other_services':
+        const databaseTypes = [
+          'MySQL',
+          'PostgreSQL',
+          'MongoDB',
+          'MariaDB',
+          'Redis',
+          'SQLite',
+        ];
+        final selectedDatabase =
+            databaseTypes.contains(_secondaryController.text)
+            ? _secondaryController.text
+            : 'MySQL';
+        const retentionOptions = ['Daily', 'Weekly', 'Monthly'];
+        final selectedRetention =
+            retentionOptions.contains(_backupRetentionController.text)
+            ? _backupRetentionController.text
+            : 'Daily';
+
         return [
           _buildField(
             controller: _titleController,
-            label: 'Judul',
-            hint: 'Backup Storage',
-            icon: Icons.widgets_rounded,
-            validatorMessage: 'Judul wajib diisi',
+            label: 'Nama Backup',
+            hint: 'Backup Production DB',
+            icon: Icons.backup_rounded,
+            validatorMessage: 'Nama backup wajib diisi',
           ),
           const SizedBox(height: 14),
           _buildField(
             controller: _primaryController,
-            label: 'Link',
-            hint: 'https://service.example.com',
-            icon: Icons.link_rounded,
-            validatorMessage: 'Link wajib diisi',
-            keyboardType: TextInputType.url,
+            label: 'Host / Database',
+            hint: 'localhost/app_db',
+            icon: Icons.dns_rounded,
+            validatorMessage: 'Host atau database wajib diisi',
+          ),
+          const SizedBox(height: 14),
+          DropdownButtonFormField<String>(
+            value: selectedDatabase,
+            decoration: InputDecoration(
+              labelText: 'Jenis Database',
+              prefixIcon: const Icon(Icons.storage_rounded),
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(18),
+              ),
+            ),
+            items: databaseTypes
+                .map(
+                  (type) =>
+                      DropdownMenuItem<String>(value: type, child: Text(type)),
+                )
+                .toList(),
+            onChanged: (value) {
+              if (value != null) {
+                setState(() => _secondaryController.text = value);
+              }
+            },
           ),
           const SizedBox(height: 14),
           _buildField(
-            controller: _descriptionController,
-            label: 'Deskripsi',
-            hint: 'Jelaskan fungsi service ini',
-            icon: Icons.notes_rounded,
-            validatorMessage: 'Deskripsi wajib diisi',
-            maxLines: 3,
+            controller: _tertiaryController,
+            label: 'Port',
+            hint: '3306',
+            icon: Icons.settings_ethernet_rounded,
+            validatorMessage: 'Port wajib diisi',
+            keyboardType: TextInputType.number,
+          ),
+          const SizedBox(height: 14),
+          _buildField(
+            controller: _backupScheduleController,
+            label: 'Jadwal Backup',
+            hint: '02:00',
+            icon: Icons.event_repeat_rounded,
+            validatorMessage: 'Jadwal backup wajib diisi',
+            readOnly: true,
+            onTap: _pickBackupSchedule,
+          ),
+          const SizedBox(height: 14),
+          DropdownButtonFormField<String>(
+            value: selectedRetention,
+            decoration: InputDecoration(
+              labelText: 'Retention',
+              prefixIcon: const Icon(Icons.history_rounded),
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(18),
+              ),
+            ),
+            items: retentionOptions
+                .map(
+                  (retention) => DropdownMenuItem<String>(
+                    value: retention,
+                    child: Text(retention),
+                  ),
+                )
+                .toList(),
+            onChanged: (value) {
+              if (value != null) {
+                setState(() => _backupRetentionController.text = value);
+              }
+            },
           ),
         ];
       case 'server':
@@ -1041,11 +1297,28 @@ server {
           const SizedBox(height: 14),
           _buildField(
             controller: _tertiaryController,
-            label: 'Port',
+            label: 'SSH Port',
             hint: '22',
             icon: Icons.settings_ethernet_rounded,
             validatorMessage: 'Port wajib diisi',
             keyboardType: TextInputType.number,
+          ),
+          const SizedBox(height: 14),
+          _buildField(
+            controller: _secondaryController,
+            label: 'Username SSH',
+            hint: 'root',
+            icon: Icons.person_rounded,
+            validatorMessage: 'Username SSH wajib diisi',
+          ),
+          const SizedBox(height: 14),
+          _buildField(
+            controller: _serverPasswordController,
+            label: 'Password SSH',
+            hint: 'Password server',
+            icon: Icons.lock_rounded,
+            validatorMessage: 'Password SSH wajib diisi',
+            obscureText: true,
           ),
         ];
       default:
@@ -1234,11 +1507,17 @@ server {
     required String validatorMessage,
     int maxLines = 1,
     TextInputType keyboardType = TextInputType.text,
+    bool readOnly = false,
+    bool obscureText = false,
+    VoidCallback? onTap,
   }) {
     return TextFormField(
       controller: controller,
       maxLines: maxLines,
       keyboardType: keyboardType,
+      readOnly: readOnly,
+      obscureText: obscureText,
+      onTap: onTap,
       decoration: InputDecoration(
         labelText: label,
         hintText: hint,
