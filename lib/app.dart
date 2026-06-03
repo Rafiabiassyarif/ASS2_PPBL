@@ -3,18 +3,6 @@ import 'package:google_fonts/google_fonts.dart';
 import 'core/preferences/app_preferences.dart';
 import 'pages/login/login_page.dart';
 import 'pages/dashboard/dashboard_page.dart';
-import 'pages/domains/domain_list_page.dart';
-import 'pages/domains/domain_add_page.dart';
-import 'pages/domains/domain_edit_page.dart';
-import 'pages/users/user_list_page.dart';
-import 'pages/users/user_add_page.dart';
-import 'pages/users/user_edit_page.dart';
-import 'pages/packages/package_list_page.dart';
-import 'pages/packages/package_add_page.dart';
-import 'pages/packages/package_edit_page.dart';
-import 'pages/tickets/ticket_list_page.dart';
-import 'pages/tickets/ticket_add_page.dart';
-import 'pages/tickets/ticket_detail_page.dart';
 import 'pages/settings/settings_page.dart';
 import 'pages/hosting/hosting_crud_page.dart';
 import 'pages/hosting/hosting_feature_spec.dart';
@@ -171,23 +159,6 @@ class App extends StatelessWidget {
                 const HostingCrudPage(feature: HostingFeatures.otherServices),
             '/hosting/server': (context) =>
                 const HostingCrudPage(feature: HostingFeatures.server),
-            // Domain routes
-            '/domains': (context) => const DomainListPage(),
-            '/domains/add': (context) => const DomainAddPage(),
-            '/domains/edit': (context) => const DomainEditPage(),
-            // User routes
-            '/users': (context) => const UserListPage(),
-            '/users/add': (context) => const UserAddPage(),
-            '/users/edit': (context) => const UserEditPage(),
-            // Package routes
-            '/packages': (context) => const PackageListPage(),
-            '/packages/add': (context) => const PackageAddPage(),
-            '/packages/edit': (context) => const PackageEditPage(),
-            // Ticket routes
-            '/tickets': (context) => const TicketListPage(),
-            '/tickets/add': (context) => const TicketAddPage(),
-            '/tickets/detail': (context) => const TicketDetailPage(),
-            // Settings route
             '/settings': (context) => const SettingsPage(),
           },
         );
